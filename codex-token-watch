@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print compact, one-shot Codex token usage for an explicitly selected task."""
+"""Print compact Codex token usage and prompt-cache diagnostics."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -94,13 +94,27 @@ def last_value(value: str) -> int:
     return count
 
 
+def since_value(value: str) -> tuple[int, str]:
+    match = re.fullmatch(r"([1-9][0-9]*)([mhd])", value.lower())
+    if not match:
+        raise argparse.ArgumentTypeError("use a duration such as 6h, 24h, or 3d")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = {"m": 60, "h": 3_600, "d": 86_400}[unit]
+    return amount * multiplier, f"{amount}{unit}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Print token usage for an explicitly selected Codex task and exit."
+        description="Print local Codex token usage and prompt-cache diagnostics."
     )
     parser.add_argument(
         "target",
-        help="Task ID, unique ID prefix, or codex://threads/<thread-id>",
+        nargs="?",
+        help=(
+            "Task ID, unique ID prefix, or codex://threads/<thread-id>; "
+            "omit with --zero-cache to scan recent tasks"
+        ),
     )
     parser.add_argument(
         "--last",
@@ -113,7 +127,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Show model calls with zero cached input, excluding compaction resets; "
-            "scans the full task unless combined with --last N"
+            "omit the task to scan all tasks active in the last 24 hours"
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        type=since_value,
+        metavar="DURATION",
+        help=(
+            "Cross-task cache-miss window such as 6h, 24h, or 3d; "
+            "requires --zero-cache without a task"
         ),
     )
     parser.add_argument(
@@ -122,9 +145,21 @@ def parse_args() -> argparse.Namespace:
         help="Disable terminal colors",
     )
     args = parser.parse_args(normalized_cli_args())
-    args.target = thread_reference(args.target)
-    if not re.fullmatch(r"[0-9a-fA-F-]{4,}", args.target):
-        parser.error("target must be a task ID, ID prefix, or codex://threads/<thread-id>")
+    if args.target is not None:
+        args.target = thread_reference(args.target)
+        if not re.fullmatch(r"[0-9a-fA-F-]{4,}", args.target):
+            parser.error(
+                "target must be a task ID, ID prefix, or codex://threads/<thread-id>"
+            )
+        if args.since is not None:
+            parser.error("--since is only available when the task is omitted")
+    else:
+        if not args.zero_cache:
+            parser.error("a task is required unless --zero-cache is used")
+        if args.last is not None:
+            parser.error("--last requires a task; use --since for a cross-task window")
+        if args.since is None:
+            args.since = (86_400, "24h")
     return args
 
 
@@ -192,6 +227,40 @@ def resolve_task(base: Path, selector: str) -> tuple[str, Path, str]:
     if task:
         return task
     raise RuntimeError(f"Codex task not found: {selector}")
+
+
+def recent_tasks(base: Path, cutoff: datetime) -> list[tuple[str, Path, str]]:
+    """Return deduplicated tasks updated inside the requested rolling window."""
+    matches: dict[str, tuple[int, str, str, str]] = {}
+    cutoff_epoch = int(cutoff.timestamp())
+    for database in task_databases(base):
+        try:
+            with readonly_connection(database) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, rollout_path, COALESCE(NULLIF(name, ''), title), updated_at
+                    FROM threads
+                    WHERE updated_at >= ?
+                    ORDER BY updated_at DESC
+                    """,
+                    (cutoff_epoch,),
+                ).fetchall()
+        except sqlite3.Error:
+            continue
+        for thread_id, rollout_path, title, updated_at in rows:
+            candidate = (int(updated_at), thread_id, rollout_path, title or "Untitled task")
+            current = matches.get(thread_id)
+            if current is None or candidate[0] > current[0]:
+                matches[thread_id] = candidate
+
+    tasks = []
+    for _updated_at, thread_id, rollout_path, title in sorted(
+        matches.values(), reverse=True
+    ):
+        path = Path(rollout_path).expanduser()
+        if path.is_file():
+            tasks.append((thread_id, path, title))
+    return tasks
 
 
 def user_message(payload: dict) -> str | None:
@@ -1013,10 +1082,111 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
     return 0
 
 
+def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
+    seconds, label = window
+    cutoff = datetime.now().astimezone() - timedelta(seconds=seconds)
+    misses = []
+    calls_checked = 0
+    tasks_scanned = 0
+
+    for thread_id, rollout, title in recent_tasks(base, cutoff):
+        try:
+            turns, calls = scan_rollout(rollout)
+        except OSError:
+            continue
+        window_calls = [
+            call
+            for call in calls
+            if call.get("time") is not None and call["time"] >= cutoff
+        ]
+        if not window_calls:
+            continue
+        window_call_ids = {id(call) for call in window_calls}
+        tasks_scanned += 1
+        calls_checked += len(window_calls)
+
+        for turn in turns:
+            for call in turn["calls"]:
+                if id(call) not in window_call_ids:
+                    continue
+                if integer(call["usage"], "cached_input_tokens") != 0:
+                    continue
+                if call["after_compaction"] or call["gap_seconds"] is None:
+                    continue
+                misses.append((call["time"], thread_id, title, turn, call))
+
+    misses.sort(key=lambda item: item[0])
+    print(
+        paint("CACHE MISSES", "bold_red")
+        + paint("  ·  ", "gray")
+        + paint(f"LAST {label.upper()}", "bold_white")
+    )
+
+    if misses:
+        print()
+        headers = ["TIME", "TASK", "GAP", "WHERE", "INPUT", "API EST.", "NEXT"]
+        rows = []
+        for _time, thread_id, title, turn, call in misses:
+            boundary = "new turn" if call["index"] == 1 else "same turn"
+            next_percent = call["next_cache_percent"]
+            next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
+            task = f"{short_text(title, 30)} [{thread_id[:8]}]"
+            gap_seconds = call["gap_seconds"]
+            rows.append(
+                {
+                    "cells": [
+                        table_time(call["timestamp"], False),
+                        task,
+                        format_gap(gap_seconds),
+                        boundary,
+                        format_count(integer(call["usage"], "input_tokens")),
+                        format_usd(call_api_cost(call)),
+                        next_value,
+                    ],
+                    "styles": [
+                        "gray",
+                        "white",
+                        "bold_red" if gap_seconds < 1_800 else "gray",
+                        "bold_red" if boundary == "same turn" else "gray",
+                        "white",
+                        "cyan",
+                        None if next_percent is None else cache_style(next_percent),
+                    ],
+                }
+            )
+        print_table(headers, rows, right={4, 5, 6})
+    else:
+        print()
+        print(paint("No complete cache misses found.", "bold_green"))
+
+    print()
+    miss_label = "miss" if len(misses) == 1 else "misses"
+    task_label = "task" if tasks_scanned == 1 else "tasks"
+    call_label = "call" if calls_checked == 1 else "calls"
+    print(
+        paint("SUMMARY", "bold_gray")
+        + "  "
+        + paint(
+            f"{len(misses)} {miss_label}  ·  "
+            f"{tasks_scanned} {task_label} scanned  ·  "
+            f"{calls_checked} model {call_label} checked",
+            "white",
+        )
+    )
+    return 0
+
+
 def main() -> int:
     global USE_COLOR
     args = parse_args()
     USE_COLOR = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.target is None:
+        try:
+            return print_recent_zero_cache(codex_dir(), args.since)
+        except (RuntimeError, OSError, sqlite3.Error) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+
     try:
         thread_id, rollout, title = resolve_task(codex_dir(), args.target)
         turns, _calls = scan_rollout(rollout)

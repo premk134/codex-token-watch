@@ -1,7 +1,10 @@
 # Codex Token Watch
 
-A lightweight local CLI for viewing per-turn token usage, prompt-cache
-performance, and API-equivalent cost for Codex Desktop tasks.
+Saw a lot of discussion around Codex cache hits and had the same confusion, so
+I built a small tool for the info and analysis.
+
+Codex Token Watch is a lightweight local CLI for viewing per-turn token usage,
+prompt-cache performance, and API-equivalent cost for Codex Desktop tasks.
 
 It runs only when called, reads Codex files locally in read-only mode, and has
 no third-party Python dependencies.
@@ -30,9 +33,16 @@ codex-token-watch --help
 
 ## Usage
 
-Pass a full task ID, a unique ID prefix, or a Codex task link:
+For a task report, pass a full task ID, a unique ID prefix, or a Codex task
+link. For a cross-task cache-miss report, omit the task.
 
 ```bash
+# Cache misses across every task active in the last 24 hours
+codex-token-watch --zero-cache
+
+# Cache misses across every task active in the last six hours
+codex-token-watch --zero-cache --since 6h
+
 # Every recorded turn
 codex-token-watch codex://threads/YOUR-TASK-ID
 
@@ -60,6 +70,10 @@ changes. The final `ALL` row always summarizes the complete task.
 - `OUTPUT` excludes reasoning tokens; `REASON` shows them separately.
 - `--zero-cache` automatically excludes cache resets caused by explicit Codex
   compaction.
+- Without a task, `--zero-cache` scans a rolling 24-hour window. Use `--since`
+  with minutes, hours, or days, such as `30m`, `6h`, or `3d`.
+- Cross-task reports omit first calls when the preceding call is unavailable,
+  because their cache-miss gap cannot be established.
 - `API EST.` is an estimate using Standard API token rates, not an actual
   Codex subscription charge. It excludes tool charges, taxes, subscription
   entitlements, and Fast/Flex/Batch adjustments.
@@ -74,8 +88,8 @@ Embedded prices were checked on 2026-09-19 against the official pages for
 
 ## Privacy and performance
 
-Codex Token Watch reads the selected task's local state and rollout files. It
-does not modify Codex data, upload task contents, or run in the background.
+Codex Token Watch reads local Codex state and rollout files. It does not modify
+Codex data, upload task contents, or run in the background.
 
 A 57 MB rollout containing 873 model calls was processed in about 0.2 seconds
 on the development Mac.
