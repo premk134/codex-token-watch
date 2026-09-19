@@ -3,13 +3,30 @@
 Saw a lot of discussion around Codex cache hits and had the same confusion, so
 I built a small tool for the info and analysis.
 
-Codex Token Watch is a lightweight local CLI for viewing per-turn token usage,
-prompt-cache performance, and API-equivalent cost for Codex Desktop tasks.
+Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
+logs into per-turn token and prompt-cache reports. It runs only when called and
+does not send task data anywhere.
 
 [Current release: v0.1.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.1.0)
 
-It runs only when called, reads Codex files locally in read-only mode, and has
-no third-party Python dependencies.
+## What it shows
+
+- Input, cached, output, and reasoning tokens for each turn
+- Model-call count and turn duration
+- Model and reasoning-effort changes
+- API-equivalent cost estimates
+- Complete cache misses and the time since the preceding model call
+- Cache misses across one task or all recently active tasks
+
+## Screenshots
+
+### Per-turn token analysis
+
+![Per-turn token analysis](docs/images/codex-token-watch-token-analysis.png)
+
+### Cache misses across recent tasks
+
+![Cross-task cache-miss analysis](docs/images/codex-token-watch-cache-misses.png)
 
 ## Requirements
 
@@ -17,72 +34,86 @@ no third-party Python dependencies.
 - Codex Desktop with local task history
 - Python 3
 
+No third-party Python packages are required.
+
 ## Install
 
-From the project directory:
-
 ```bash
+git clone https://github.com/premk134/codex-token-watch.git
+cd codex-token-watch
 chmod +x codex-token-watch
 mkdir -p "$HOME/.local/bin"
 ln -s "$(pwd)/codex-token-watch" "$HOME/.local/bin/codex-token-watch"
 ```
 
-Make sure `~/.local/bin` is on your `PATH`, then check:
+If the command is not found, add this line to `~/.zshrc` and open a new
+terminal:
 
 ```bash
-codex-token-watch --help
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Usage
-
-For a task report, pass a full task ID, a unique ID prefix, or a Codex task
-link. For a cross-task cache-miss report, omit the task.
+Check the installation:
 
 ```bash
-# Cache misses across every task active in the last 24 hours
-codex-token-watch --zero-cache
+codex-token-watch --version
+```
 
-# Cache misses across every task active in the last six hours
-codex-token-watch --zero-cache --since 6h
+## Quick start
 
-# Every recorded turn
-codex-token-watch codex://threads/YOUR-TASK-ID
+Copy a task link from Codex Desktop. It looks like:
 
-# Latest five turns
+```text
+codex://threads/YOUR-TASK-ID
+```
+
+Then run one of these commands:
+
+```bash
+# Latest five turns from one task
 codex-token-watch codex://threads/YOUR-TASK-ID --last 5
 
-# Calls with no cached input
+# Every recorded turn from one task
+codex-token-watch codex://threads/YOUR-TASK-ID
+
+# Complete cache misses from one task
 codex-token-watch codex://threads/YOUR-TASK-ID --zero-cache
 
-# Cache misses within the latest three turns
-codex-token-watch codex://threads/YOUR-TASK-ID --zero-cache --last 3
+# Cache misses across tasks active during the past 24 hours
+codex-token-watch --zero-cache
 
-# Plain output without colors
-codex-token-watch codex://threads/YOUR-TASK-ID --no-color
+# Cache misses across tasks active during a custom window
+codex-token-watch --zero-cache --since 6h
 ```
 
-The normal report includes input, cache percentage, output, reasoning, estimated
-API cost, cumulative task tokens, model-call count, duration, and model/effort
-changes. The final `ALL` row always summarizes the complete task.
+`--since` accepts minutes, hours, or days, such as `30m`, `6h`, or `3d`.
+Use `--no-color` for plain output.
 
-## Notes
+## Reading the report
 
-- `INPUT` adds together input from every model call in the turn, so it can be
+- `INPUT` is the total input across every model call in the turn. It can be
   larger than the model's context window.
+- `CACHE` is the percentage of input tokens served from the prompt cache.
 - `OUTPUT` excludes reasoning tokens; `REASON` shows them separately.
-- `--zero-cache` automatically excludes cache resets caused by explicit Codex
-  compaction.
-- Without a task, `--zero-cache` scans a rolling 24-hour window. Use `--since`
-  with minutes, hours, or days, such as `30m`, `6h`, or `3d`.
-- Cross-task reports omit first calls when the preceding call is unavailable,
-  because their cache-miss gap cannot be established.
-- `NEXT TURN` in a cache-miss report is the aggregate cache-hit percentage of
-  the following recorded turn.
-- `API EST.` is an estimate using Standard API token rates, not an actual
-  Codex subscription charge. It excludes tool charges, taxes, subscription
-  entitlements, and Fast/Flex/Batch adjustments.
-- Unknown models or incomplete historical data display `—` instead of an
-  unsafe estimate.
+- `THREAD` is the cumulative token total recorded for the task.
+- `ALL` summarizes the complete task, even when `--last` limits the visible
+  turns.
+- `NEXT TURN` is the following turn's aggregate cache percentage.
+- `API EST.` is an API-equivalent estimate, not a Codex subscription charge.
+
+A complete cache miss means a recorded model call had zero cached input.
+Cache-miss reports automatically exclude explicit compaction resets.
+Cross-task reports also exclude first calls when the preceding call is not
+available, because their gap cannot be calculated.
+
+## Privacy, cost, and performance
+
+Codex Token Watch reads local Codex state and rollout files in read-only mode.
+It does not modify Codex data, upload task contents, or run in the background.
+
+Cost estimates use Standard API token rates and exclude tool charges, taxes,
+subscription entitlements, and Fast/Flex/Batch adjustments. Unknown models or
+incomplete history display `—` instead of an estimate.
 
 Embedded prices were checked on 2026-09-19 against the official pages for
 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
@@ -90,10 +121,9 @@ Embedded prices were checked on 2026-09-19 against the official pages for
 [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), and
 [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
 
-## Privacy and performance
-
-Codex Token Watch reads local Codex state and rollout files. It does not modify
-Codex data, upload task contents, or run in the background.
-
 A 57 MB rollout containing 873 model calls was processed in about 0.2 seconds
-on the development Mac.
+on the development Mac. Cross-task runtime depends on how many recent tasks are
+inside the selected time window.
+
+Codex Desktop's local file format may change in future versions, which could
+require an update to this tool.
