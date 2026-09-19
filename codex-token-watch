@@ -1,0 +1,1051 @@
+#!/usr/bin/env python3
+"""Print compact, one-shot Codex token usage for an explicitly selected task."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+
+TASK_TITLE_LIMIT = 96
+PROMPT_LIMIT = 112
+USE_COLOR = False
+LONG_CONTEXT_THRESHOLD = 272_000
+
+# Standard API rates in USD per 1M text tokens. Cache writes are documented as
+# 1.25x uncached input for these models.
+API_PRICING = {
+    "gpt-6-astra": {"input": 10.00, "cached": 1.00, "cache_write": 12.50, "output": 50.00},
+    "gpt-5.6-sol": {"input": 4.00, "cached": 0.40, "cache_write": 5.00, "output": 20.00},
+    "gpt-5.6": {"input": 4.00, "cached": 0.40, "cache_write": 5.00, "output": 20.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached": 0.20, "cache_write": 2.50, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached": 0.02, "cache_write": 0.25, "output": 1.20},
+}
+
+MODEL_LABELS = {
+    "gpt-6-astra": "Astra",
+    "gpt-5.6-sol": "Sol",
+    "gpt-5.6": "Sol",
+    "gpt-5.6-terra": "Terra",
+    "gpt-5.6-luna": "Luna",
+}
+
+MODEL_HEADER_LABELS = {
+    "gpt-6-astra": "GPT-6 Astra",
+    "gpt-5.6-sol": "GPT-5.6 Sol",
+    "gpt-5.6": "GPT-5.6 Sol",
+    "gpt-5.6-terra": "GPT-5.6 Terra",
+    "gpt-5.6-luna": "GPT-5.6 Luna",
+}
+
+ANSI = {
+    "bold": "1",
+    "dim": "2",
+    "gray": "38;5;245",
+    "white": "38;5;255",
+    "red": "38;5;203",
+    "green": "38;5;114",
+    "yellow": "38;5;221",
+    "cyan": "38;5;81",
+    "sky": "38;5;81",
+    "violet": "38;5;147",
+    "bold_gray": "1;38;5;245",
+    "bold_white": "1;38;5;255",
+    "bold_red": "1;38;5;203",
+    "bold_green": "1;38;5;114",
+    "bold_yellow": "1;38;5;221",
+    "bold_cyan": "1;38;5;81",
+    "bold_sky": "1;38;5;81",
+    "bold_violet": "1;38;5;147",
+}
+
+
+def normalized_cli_args() -> list[str]:
+    """Allow the convenient legacy-looking --codex://threads/... spelling."""
+    normalized = []
+    for argument in sys.argv[1:]:
+        if argument.startswith("--codex://threads/"):
+            normalized.append(argument[2:])
+        else:
+            normalized.append(argument)
+    return normalized
+
+
+def thread_reference(value: str) -> str:
+    match = re.fullmatch(r"codex://threads/([0-9a-fA-F-]+)", value)
+    return match.group(1) if match else value
+
+
+def last_value(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use a positive number") from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return count
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Print token usage for an explicitly selected Codex task and exit."
+    )
+    parser.add_argument(
+        "target",
+        help="Task ID, unique ID prefix, or codex://threads/<thread-id>",
+    )
+    parser.add_argument(
+        "--last",
+        type=last_value,
+        metavar="N",
+        help="Show only the latest N turns; omitted means every turn",
+    )
+    parser.add_argument(
+        "--zero-cache",
+        action="store_true",
+        help=(
+            "Show model calls with zero cached input, excluding compaction resets; "
+            "scans the full task unless combined with --last N"
+        ),
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable terminal colors",
+    )
+    args = parser.parse_args(normalized_cli_args())
+    args.target = thread_reference(args.target)
+    if not re.fullmatch(r"[0-9a-fA-F-]{4,}", args.target):
+        parser.error("target must be a task ID, ID prefix, or codex://threads/<thread-id>")
+    return args
+
+
+def codex_dir() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def version_key(path: Path) -> tuple[int, int]:
+    match = re.search(r"_(\d+)\.sqlite$", path.name)
+    return (int(match.group(1)) if match else -1, path.stat().st_mtime_ns)
+
+
+def readonly_connection(path: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=0.2)
+    connection.execute("PRAGMA query_only = ON")
+    connection.execute("PRAGMA busy_timeout = 200")
+    return connection
+
+
+def task_databases(base: Path) -> list[Path]:
+    databases = sorted(base.glob("state_*.sqlite"), key=version_key, reverse=True)
+    if not databases:
+        raise RuntimeError(f"No Codex state database found under {base}")
+    return databases
+
+
+def validate_task_row(row: tuple[str, str, str]) -> tuple[str, Path, str]:
+    resolved_id, rollout_path, title = row
+    path = Path(rollout_path).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"Rollout file does not exist: {path}")
+    return resolved_id, path, title or "Untitled task"
+
+
+def find_task(databases: list[Path], selector: str) -> tuple[str, Path, str] | None:
+    matches: dict[str, tuple[str, str, str]] = {}
+    for database in databases:
+        try:
+            with readonly_connection(database) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, rollout_path, COALESCE(NULLIF(name, ''), title)
+                    FROM threads
+                    WHERE id = ? OR id LIKE ?
+                    """,
+                    (selector, f"{selector}%"),
+                ).fetchall()
+        except sqlite3.Error:
+            continue
+        for row in rows:
+            matches.setdefault(row[0], row)
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        choices = ", ".join(sorted(thread_id[:12] for thread_id in matches))
+        raise RuntimeError(f"Task ID prefix is ambiguous ({choices}); provide more characters")
+    return validate_task_row(next(iter(matches.values())))
+
+
+def resolve_task(base: Path, selector: str) -> tuple[str, Path, str]:
+    task = find_task(task_databases(base), selector)
+    if task:
+        return task
+    raise RuntimeError(f"Codex task not found: {selector}")
+
+
+def user_message(payload: dict) -> str | None:
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    pieces = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("text")
+        if item.get("type") in {"input_text", "text"} and isinstance(value, str):
+            pieces.append(value)
+    return " ".join(pieces) or None
+
+
+def synthetic_context_message(value: str) -> bool:
+    """Exclude Codex-injected context blocks from the user-visible turn label."""
+    stripped = value.lstrip()
+    return stripped.startswith(
+        (
+            "<recommended_plugins>",
+            "<app-context>",
+            "<environment_context>",
+            "# AGENTS.md instructions",
+            "<skill>",
+        )
+    )
+
+
+def parsed_time(timestamp: str | None) -> datetime | None:
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def integer(mapping: dict, key: str) -> int:
+    value = mapping.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
+def scan_rollout(path: Path) -> tuple[list[dict], list[dict]]:
+    turns: dict[str, dict] = {}
+    turn_order: list[str] = []
+    calls: list[dict] = []
+    active_turn: str | None = None
+    compaction_pending = False
+
+    def ensure_turn(turn_id: str) -> dict:
+        if turn_id not in turns:
+            turns[turn_id] = {
+                "id": turn_id,
+                "prompt": None,
+                "status": None,
+                "started_time": None,
+                "status_time": None,
+                "latest_record": None,
+                "calls": [],
+                "model": None,
+                "effort": None,
+            }
+            turn_order.append(turn_id)
+        return turns[turn_id]
+
+    with path.open(errors="replace") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            record_type = record.get("type")
+            if record_type == "compacted":
+                compaction_pending = True
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if record_type == "turn_context":
+                turn_id = payload.get("turn_id")
+                if turn_id:
+                    active_turn = turn_id
+                    turn = ensure_turn(turn_id)
+                    turn["model"] = payload.get("model")
+                    turn["effort"] = payload.get("effort")
+                continue
+
+            if record_type == "response_item":
+                text = user_message(payload)
+                if active_turn and text and not synthetic_context_message(text):
+                    turn = ensure_turn(active_turn)
+                    if not turn["prompt"]:
+                        turn["prompt"] = text
+                continue
+
+            if record_type == "token_usage_record":
+                turn_id = payload.get("turn_id")
+                usage = payload.get("usage")
+                if not turn_id or not isinstance(usage, dict):
+                    continue
+                input_tokens = usage.get("input_tokens")
+                cached_tokens = usage.get("cached_input_tokens")
+                if not isinstance(input_tokens, int) or input_tokens <= 0:
+                    continue
+                if not isinstance(cached_tokens, int):
+                    continue
+                turn = ensure_turn(turn_id)
+                call = {
+                    "turn_id": turn_id,
+                    "timestamp": record.get("timestamp"),
+                    "time": parsed_time(record.get("timestamp")),
+                    "usage": usage,
+                    "index": len(turn["calls"]) + 1,
+                    "gap_seconds": None,
+                    "next_cache_percent": None,
+                    "after_compaction": compaction_pending,
+                    "model": turn["model"],
+                    "effort": turn["effort"],
+                }
+                turn["calls"].append(call)
+                calls.append(call)
+                compaction_pending = False
+                if isinstance(payload.get("turn_token_usage"), dict):
+                    turn["latest_record"] = record
+                continue
+
+            if record_type == "event_msg":
+                event_type = payload.get("type")
+                turn_id = payload.get("turn_id")
+                if event_type == "task_started" and turn_id:
+                    active_turn = turn_id
+                    turn = ensure_turn(turn_id)
+                    turn["started_time"] = record.get("timestamp")
+                elif event_type in {"task_complete", "turn_aborted"} and turn_id:
+                    turn = ensure_turn(turn_id)
+                    turn["status"] = (
+                        "completed" if event_type == "task_complete" else "aborted"
+                    )
+                    turn["status_time"] = record.get("timestamp")
+                    if active_turn == turn_id:
+                        active_turn = None
+
+    previous = None
+    for call in calls:
+        if previous and call["time"] and previous["time"]:
+            call["gap_seconds"] = (call["time"] - previous["time"]).total_seconds()
+        previous = call
+
+    for index, call in enumerate(calls[:-1]):
+        following = calls[index + 1]
+        if following["turn_id"] == call["turn_id"]:
+            next_input = integer(following["usage"], "input_tokens")
+            next_cached = integer(following["usage"], "cached_input_tokens")
+            if next_input:
+                call["next_cache_percent"] = next_cached / next_input * 100.0
+
+    ordered_turns = [turns[turn_id] for turn_id in turn_order]
+    for turn in ordered_turns:
+        for key in ("model", "effort"):
+            known = {call[key] for call in turn["calls"] if call.get(key)}
+            if turn.get(key):
+                known.add(turn[key])
+            if len(known) == 1:
+                inferred = next(iter(known))
+                for call in turn["calls"]:
+                    if not call.get(key):
+                        call[key] = inferred
+        if turn["status"]:
+            continue
+        if turn["id"] == active_turn:
+            turn["status"] = "running snapshot"
+        else:
+            turn["status"] = "latest snapshot"
+        if turn["latest_record"]:
+            turn["status_time"] = turn["latest_record"].get("timestamp")
+    return ordered_turns, calls
+
+
+def local_time(timestamp: str | None) -> str:
+    parsed = parsed_time(timestamp)
+    if parsed:
+        return parsed.astimezone().strftime("%b %d %H:%M:%S")
+    return "unknown time"
+
+
+def compact_local_time(timestamp: str | None) -> str:
+    parsed = parsed_time(timestamp)
+    if parsed:
+        return parsed.astimezone().strftime("%b %d %H:%M")
+    return "unknown"
+
+
+def short_text(value: str, limit: int) -> str:
+    one_line = " ".join(value.split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - 1].rstrip() + "…"
+
+
+def format_count(value: int) -> str:
+    if value < 1_000:
+        return f"{value:,}"
+    thousands = value / 1_000
+    if thousands < 10:
+        return f"{thousands:.1f}K"
+    return f"{thousands:,.0f}K"
+
+
+def pricing_for_model(model: str | None) -> dict[str, float] | None:
+    if not model:
+        return None
+    if model in API_PRICING:
+        return API_PRICING[model]
+    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        if model.startswith(prefix + "-"):
+            return API_PRICING[prefix]
+    return None
+
+
+def model_display(model: str) -> str:
+    if model in MODEL_LABELS:
+        return MODEL_LABELS[model]
+    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        if model.startswith(prefix + "-"):
+            return MODEL_LABELS[prefix]
+    return model
+
+
+def model_header_display(model: str) -> str:
+    if model in MODEL_HEADER_LABELS:
+        return MODEL_HEADER_LABELS[model]
+    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        if model.startswith(prefix + "-"):
+            return MODEL_HEADER_LABELS[prefix]
+    return model
+
+
+def call_api_cost(call: dict) -> float | None:
+    rates = pricing_for_model(call.get("model"))
+    if rates is None:
+        return None
+
+    usage = call["usage"]
+    input_tokens = integer(usage, "input_tokens")
+    cached_tokens = min(input_tokens, integer(usage, "cached_input_tokens"))
+    writable_tokens = max(0, input_tokens - cached_tokens)
+    cache_write_tokens = min(
+        writable_tokens, integer(usage, "cache_write_input_tokens")
+    )
+    fresh_tokens = max(0, input_tokens - cached_tokens - cache_write_tokens)
+    output_tokens = integer(usage, "output_tokens")
+
+    input_multiplier = 2.0 if input_tokens > LONG_CONTEXT_THRESHOLD else 1.0
+    output_multiplier = 1.5 if input_tokens > LONG_CONTEXT_THRESHOLD else 1.0
+    return (
+        fresh_tokens * rates["input"] * input_multiplier
+        + cached_tokens * rates["cached"] * input_multiplier
+        + cache_write_tokens * rates["cache_write"] * input_multiplier
+        + output_tokens * rates["output"] * output_multiplier
+    ) / 1_000_000
+
+
+def turn_api_cost(turn: dict) -> float | None:
+    record = turn.get("latest_record")
+    if not record:
+        return None
+    expected = record.get("payload", {}).get("turn_token_usage", {})
+    calls = turn.get("calls", [])
+    if not calls:
+        return None
+
+    # Per-call data is required to apply the >272K request multiplier correctly.
+    # Refuse to display a partial estimate if older call data is unavailable.
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        if sum(integer(call["usage"], key) for call in calls) != integer(expected, key):
+            return None
+
+    costs = [call_api_cost(call) for call in calls]
+    if any(cost is None for cost in costs):
+        return None
+    return sum(cost for cost in costs if cost is not None)
+
+
+def thread_api_cost(turns: list[dict], usage: dict) -> float | None:
+    calls = [call for turn in turns for call in turn.get("calls", [])]
+    costs = [call_api_cost(call) for call in calls]
+    if any(cost is None for cost in costs):
+        return None
+
+    keys = (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+    )
+    residual = {
+        key: integer(usage, key) - sum(integer(call["usage"], key) for call in calls)
+        for key in keys
+    }
+    if any(value < 0 for value in residual.values()):
+        return None
+    if not any(residual.values()):
+        return sum(cost for cost in costs if cost is not None)
+
+    # A continued rollout can inherit a small usage baseline. It is safe to
+    # estimate only when the missing input cannot conceal a >272K request and
+    # every visible call used the same model.
+    models = {call.get("model") for call in calls if call.get("model")}
+    if residual["input_tokens"] > LONG_CONTEXT_THRESHOLD or len(models) != 1:
+        return None
+    inherited_call = {"model": next(iter(models)), "usage": residual}
+    inherited_cost = call_api_cost(inherited_call)
+    if inherited_cost is None:
+        return None
+    return sum(cost for cost in costs if cost is not None) + inherited_cost
+
+
+def format_usd(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value < 0.01:
+        return f"${value:.4f}"
+    return f"${value:,.2f}"
+
+
+def turn_setting(turn: dict, key: str) -> str:
+    values = {call.get(key) for call in turn.get("calls", []) if call.get(key)}
+    if not values and turn.get(key):
+        values.add(turn[key])
+    if len(values) > 1:
+        return "mixed"
+    return next(iter(values), "—")
+
+
+def thread_setting(turns: list[dict], key: str) -> str:
+    values = {
+        call.get(key)
+        for turn in turns
+        for call in turn.get("calls", [])
+        if call.get(key)
+    }
+    if len(values) > 1:
+        return "mixed"
+    return next(iter(values), "—")
+
+
+def latest_thread_turn(turns: list[dict]) -> dict:
+    return max(
+        turns,
+        key=lambda turn: integer(
+            turn["latest_record"].get("payload", {}).get("thread_token_usage", {}),
+            "total_tokens",
+        ),
+    )
+
+
+def task_bounds(turns: list[dict]) -> tuple[datetime | None, datetime | None]:
+    bounds = [turn_bounds(turn) for turn in turns]
+    starts = [start for start, _end in bounds if start is not None]
+    ends = [end for _start, end in bounds if end is not None]
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def task_period(turns: list[dict]) -> str:
+    start, end = task_bounds(turns)
+    if start is None or end is None:
+        return "unknown"
+    local_start = start.astimezone()
+    local_end = end.astimezone()
+    if local_start.date() == local_end.date():
+        return f"{local_start:%b %d}, {local_start:%H:%M}–{local_end:%H:%M}"
+    return f"{local_start:%b %d %H:%M}–{local_end:%b %d %H:%M}"
+
+
+def single_task_date(turns: list[dict]) -> bool:
+    start, end = task_bounds(turns)
+    return bool(
+        start is not None
+        and end is not None
+        and start.astimezone().date() == end.astimezone().date()
+    )
+
+
+def table_time(timestamp: str | None, time_only: bool) -> str:
+    parsed = parsed_time(timestamp)
+    if not parsed:
+        return "unknown"
+    local = parsed.astimezone()
+    return local.strftime("%H:%M" if time_only else "%b %d %H:%M")
+
+
+def turn_change_map(turns: list[dict]) -> dict[str, str]:
+    changes = {}
+    previous_model = None
+    previous_effort = None
+    for turn in turns:
+        model = turn_setting(turn, "model")
+        effort = turn_setting(turn, "effort")
+
+        # Some resumed/continued turns contain usage but omit turn-context
+        # metadata. Treat those missing values as unchanged instead of showing
+        # a pair of misleading transitions through —/—.
+        current_model = previous_model if model == "—" else model
+        current_effort = previous_effort if effort == "—" else effort
+        pieces = []
+        if (
+            previous_model is not None
+            and previous_effort is not None
+            and current_model is not None
+            and current_effort is not None
+            and (current_model, current_effort) != (
+            previous_model,
+            previous_effort,
+            )
+        ):
+            before = f"{model_display(previous_model)}/{previous_effort}"
+            after = f"{model_display(current_model)}/{current_effort}"
+            pieces.append(f"{before}→{after}")
+        if turn["status"] == "aborted":
+            pieces.append("aborted")
+        elif turn["status"] == "running snapshot":
+            pieces.append("running")
+        changes[turn["id"]] = "; ".join(pieces)
+        if current_model is not None:
+            previous_model = current_model
+        if current_effort is not None:
+            previous_effort = current_effort
+    return changes
+
+
+def format_gap(seconds: float | None) -> str:
+    if seconds is None:
+        return "history unavailable"
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, second = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {second}s"
+    hours, minute = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minute}m"
+    days, hour = divmod(hours, 24)
+    return f"{days}d {hour}h"
+
+
+def turn_bounds(turn: dict) -> tuple[datetime | None, datetime | None]:
+    call_times = [call["time"] for call in turn.get("calls", []) if call.get("time")]
+    start = parsed_time(turn.get("started_time"))
+    if start is None and call_times:
+        start = min(call_times)
+    end = parsed_time(turn.get("status_time"))
+    if end is None and call_times:
+        end = max(call_times)
+    return start, end
+
+
+def turn_duration(turn: dict) -> str:
+    start, end = turn_bounds(turn)
+    if start is None or end is None:
+        return "—"
+    seconds = max(0.0, (end - start).total_seconds())
+    return f"{int((seconds + 30) // 60)}m"
+
+
+def thread_duration(turns: list[dict]) -> str:
+    bounds = [turn_bounds(turn) for turn in turns]
+    starts = [start for start, _end in bounds if start is not None]
+    ends = [end for _start, end in bounds if end is not None]
+    if not starts or not ends:
+        return "—"
+    seconds = max(0.0, (max(ends) - min(starts)).total_seconds())
+    return f"{int((seconds + 30) // 60)}m"
+
+
+def paint(value: str, style: str | None) -> str:
+    if not USE_COLOR or not style:
+        return value
+    return f"\033[{ANSI[style]}m{value}\033[0m"
+
+
+def cache_style(percent: float) -> str:
+    if percent >= 95.0:
+        return "green"
+    if percent >= 90.0:
+        return "yellow"
+    return "bold_red" if percent == 0 else "red"
+
+
+def change_style(value: str) -> str:
+    if "aborted" in value:
+        return "bold_red"
+    if "running" in value:
+        return "bold_yellow"
+    if "→" in value:
+        return "bold_cyan"
+    return "gray"
+
+
+def header_style(value: str) -> str:
+    return {
+        "TIME": "bold_gray",
+        "CHANGE": "bold_gray",
+        "CALL": "bold_red",
+        "CALLS": "bold_white",
+        "DURATION": "bold_white",
+        "INPUT": "bold_white",
+        "CACHE": "bold_white",
+        "OUTPUT": "bold_white",
+        "REASON": "bold_gray",
+        "API EST.": "bold_cyan",
+        "THREAD": "bold_white",
+        "GAP": "bold_yellow",
+        "WHERE": "bold_gray",
+        "NEXT": "bold_green",
+        "PROMPT": "bold_gray",
+    }.get(value, "bold_white")
+
+
+def status_display(status: str) -> tuple[str, str]:
+    if status == "completed":
+        return "done", "bold_green"
+    if status == "aborted":
+        return "aborted", "bold_red"
+    if status == "running snapshot":
+        return "running", "bold_yellow"
+    return "snapshot", "bold_sky"
+
+
+def table_width(headers: list[str], rows: list[dict]) -> int:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row["cells"]):
+            widths[index] = max(widths[index], len(value))
+    return sum(widths) + 2 * (len(widths) - 1)
+
+
+def add_prompt_column(headers: list[str], rows: list[dict], prompts: list[str | None]) -> bool:
+    available = shutil.get_terminal_size(fallback=(120, 24)).columns - table_width(headers, rows) - 2
+    if available < 18:
+        return False
+    width = min(48, available)
+    headers.append("PROMPT")
+    for row, prompt in zip(rows, prompts):
+        row["cells"].append(short_text(prompt or "—", width))
+        row["styles"].append("gray")
+    return True
+
+
+def print_prompt_legend(turns: list[dict]) -> None:
+    width = max(24, shutil.get_terminal_size(fallback=(120, 24)).columns - 13)
+    print()
+    print(paint("PROMPTS", "bold_gray"))
+    seen = set()
+    for turn in turns:
+        if turn["id"] in seen or not turn["prompt"]:
+            continue
+        seen.add(turn["id"])
+        turn_label = local_time(turn["status_time"])
+        print(
+            f"{paint(turn_label, 'sky')}  "
+            f"{paint(short_text(turn['prompt'], width), 'gray')}"
+        )
+
+
+def print_table(headers: list[str], rows: list[dict], right: set[int] | None = None) -> None:
+    right = right or set()
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row["cells"]):
+            widths[index] = max(widths[index], len(value))
+
+    header = "  ".join(
+        paint(
+            value.rjust(widths[index]) if index in right else value.ljust(widths[index]),
+            header_style(value),
+        )
+        for index, value in enumerate(headers)
+    )
+    print(header)
+    print(paint("  ".join("─" * width for width in widths), "gray"))
+    for row in rows:
+        if row.get("separator_before"):
+            print(paint("  ".join("─" * width for width in widths), "gray"))
+        parts = []
+        for index, value in enumerate(row["cells"]):
+            padded = value.rjust(widths[index]) if index in right else value.ljust(widths[index])
+            parts.append(paint(padded, row["styles"][index]))
+        print("  ".join(parts))
+
+
+def print_header(title: str, thread_id: str) -> None:
+    print(
+        f"{paint('TASK', 'bold_cyan')}  "
+        f"{paint(short_text(title, TASK_TITLE_LIMIT), 'bold_white')} "
+        f"{paint(f'[{thread_id[:8]}]', 'gray')}"
+    )
+
+
+def print_metadata(turns: list[dict]) -> None:
+    latest = latest_thread_turn(turns)
+    status, status_color = status_display(latest["status"])
+    print(
+        f"{paint('PERIOD', 'bold_cyan')}  "
+        f"{paint(task_period(turns), 'white')}"
+    )
+    print(
+        f"{paint(model_header_display(turn_setting(latest, 'model')), 'bold_white')}  "
+        f"{paint('·', 'gray')}  "
+        f"{paint(turn_setting(latest, 'effort'), 'bold_cyan')}  "
+        f"{paint('·', 'gray')}  "
+        f"{paint(status, status_color)}"
+    )
+
+
+def turn_row(turn: dict, time_only: bool) -> dict:
+    record = turn["latest_record"]
+    payload = record.get("payload", {})
+    usage = payload.get("turn_token_usage", {})
+    thread = payload.get("thread_token_usage", {})
+    input_tokens = integer(usage, "input_tokens")
+    cached = integer(usage, "cached_input_tokens")
+    total_output = integer(usage, "output_tokens")
+    reasoning = integer(usage, "reasoning_output_tokens")
+    output = max(0, total_output - reasoning)
+    hit_rate = cached / input_tokens * 100.0 if input_tokens else 0.0
+    thread_total = integer(thread, "total_tokens")
+
+    return {
+        "cells": [
+            table_time(turn["status_time"], time_only),
+            format_count(input_tokens),
+            f"{hit_rate:.1f}%",
+            format_count(output),
+            format_count(reasoning),
+            format_usd(turn_api_cost(turn)),
+            format_count(thread_total),
+            str(len(turn["calls"])),
+            turn_duration(turn),
+        ],
+        "styles": [
+            "gray",
+            "white",
+            cache_style(hit_rate),
+            "white",
+            "gray",
+            "cyan",
+            "white",
+            "gray",
+            "gray",
+        ],
+    }
+
+
+def thread_row(turns: list[dict]) -> dict:
+    latest = latest_thread_turn(turns)
+    record = latest["latest_record"]
+    usage = record.get("payload", {}).get("thread_token_usage", {})
+    input_tokens = integer(usage, "input_tokens")
+    cached = integer(usage, "cached_input_tokens")
+    total_output = integer(usage, "output_tokens")
+    reasoning = integer(usage, "reasoning_output_tokens")
+    output = max(0, total_output - reasoning)
+    hit_rate = cached / input_tokens * 100.0 if input_tokens else 0.0
+    total = integer(usage, "total_tokens")
+    return {
+        "cells": [
+            "ALL",
+            format_count(input_tokens),
+            f"{hit_rate:.1f}%",
+            format_count(output),
+            format_count(reasoning),
+            format_usd(thread_api_cost(turns, usage)),
+            format_count(total),
+            str(sum(len(turn["calls"]) for turn in turns)),
+            thread_duration(turns),
+        ],
+        "styles": [
+            "bold_cyan",
+            "bold_white",
+            cache_style(hit_rate),
+            "bold_white",
+            "bold_gray",
+            "bold_cyan",
+            "bold_white",
+            "bold_gray",
+            "bold_gray",
+        ],
+        "separator_before": True,
+    }
+
+
+def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
+    headers = [
+        "TIME",
+        "INPUT",
+        "CACHE",
+        "OUTPUT",
+        "REASON",
+        "API EST.",
+        "THREAD",
+        "CALLS",
+        "DURATION",
+    ]
+    time_only = single_task_date(all_turns)
+    rows = [turn_row(turn, time_only) for turn in turns]
+    changes = turn_change_map(all_turns)
+    selected_changes = [changes.get(turn["id"], "") for turn in turns]
+    show_changes = any(selected_changes)
+    numeric_columns = set(range(1, len(headers)))
+    if show_changes:
+        headers.append("CHANGE")
+        for row, change in zip(rows, selected_changes):
+            row["cells"].append(change)
+            row["styles"].append(change_style(change))
+
+    prompts = [turn["prompt"] for turn in turns]
+    summary = thread_row(all_turns)
+    if show_changes:
+        summary["cells"].append("")
+        summary["styles"].append("gray")
+    rows.append(summary)
+    prompts.append("Complete task")
+    has_prompt_column = add_prompt_column(headers, rows, prompts)
+    print_table(headers, rows, right=numeric_columns)
+    if not has_prompt_column and len(turns) <= 5:
+        print_prompt_legend(turns)
+
+
+def selected_turns(turns: list[dict], last: int | None) -> list[dict]:
+    available = [turn for turn in turns if turn["latest_record"]]
+    if last is None:
+        return available
+    return available[-last:]
+
+
+def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
+    total_calls = sum(len(turn["calls"]) for turn in turns)
+    misses = [
+        (turn, call)
+        for turn in turns
+        for call in turn["calls"]
+        if integer(call["usage"], "cached_input_tokens") == 0
+        and not call["after_compaction"]
+    ]
+    summary_style = "bold_red" if misses else "bold_green"
+    print(
+        paint("COMPLETE CACHE MISSES", summary_style)
+        + f"  {len(misses)} / {total_calls} model calls"
+    )
+    if not misses:
+        return 0
+
+    headers = [
+        "TIME",
+        "CALL",
+        "GAP",
+        "WHERE",
+        "INPUT",
+        "API EST.",
+        "NEXT",
+    ]
+    rows = []
+    prompts = []
+    changes = turn_change_map(all_turns)
+    row_changes = []
+    change_seen = set()
+    time_only = single_task_date(all_turns)
+    for turn, call in misses:
+        boundary = "new turn" if call["index"] == 1 else "same turn"
+        next_percent = call["next_cache_percent"]
+        next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
+        rows.append(
+            {
+                "cells": [
+                    table_time(call["timestamp"], time_only),
+                    f"{call['index']}/{len(turn['calls'])}",
+                    format_gap(call["gap_seconds"]),
+                    boundary,
+                    format_count(integer(call["usage"], "input_tokens")),
+                    format_usd(call_api_cost(call)),
+                    next_value,
+                ],
+                "styles": [
+                    "gray",
+                    "bold_red",
+                    "yellow" if (call["gap_seconds"] or 0) < 1800 else "red",
+                    "yellow" if boundary == "same turn" else None,
+                    "white",
+                    "cyan",
+                    None if next_percent is None else cache_style(next_percent),
+                ],
+            }
+        )
+        prompts.append(turn["prompt"])
+        change = changes.get(turn["id"], "") if turn["id"] not in change_seen else ""
+        row_changes.append(change)
+        change_seen.add(turn["id"])
+
+    show_changes = any(row_changes)
+    if show_changes:
+        headers.append("CHANGE")
+        for row, change in zip(rows, row_changes):
+            row["cells"].append(change)
+            row["styles"].append(change_style(change))
+    right = {1, 4, 5, 6}
+    has_prompt_column = add_prompt_column(headers, rows, prompts)
+    print_table(headers, rows, right=right)
+    miss_turns = [turn for turn, _call in misses]
+    if not has_prompt_column and len({turn["id"] for turn in miss_turns}) <= 10:
+        print_prompt_legend(miss_turns)
+    return 0
+
+
+def main() -> int:
+    global USE_COLOR
+    args = parse_args()
+    USE_COLOR = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    try:
+        thread_id, rollout, title = resolve_task(codex_dir(), args.target)
+        turns, _calls = scan_rollout(rollout)
+    except (RuntimeError, OSError, sqlite3.Error) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    all_turns = [turn for turn in turns if turn["latest_record"]]
+    reports = selected_turns(turns, args.last)
+    print_header(title, thread_id)
+    if not reports:
+        print("No turns with token usage found in this task.")
+        return 1
+    print_metadata(all_turns)
+
+    if args.zero_cache:
+        print()
+        return print_zero_cache(reports, all_turns)
+
+    print()
+    if len(reports) > 1:
+        print(
+            paint("TURNS", "bold_gray")
+            + "  "
+            + paint(str(len(reports)), "bold_white")
+        )
+    print_turns(reports, all_turns)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
