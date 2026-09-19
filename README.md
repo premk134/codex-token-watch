@@ -6,6 +6,8 @@ I built a small tool for the info and analysis.
 Codex Token Watch is a lightweight local CLI for viewing per-turn token usage,
 prompt-cache performance, and API-equivalent cost for Codex Desktop tasks.
 
+[Current release: v0.1.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.1.0)
+
 It runs only when called, reads Codex files locally in read-only mode, and has
 no third-party Python dependencies.
 
@@ -74,6 +76,8 @@ changes. The final `ALL` row always summarizes the complete task.
   with minutes, hours, or days, such as `30m`, `6h`, or `3d`.
 - Cross-task reports omit first calls when the preceding call is unavailable,
   because their cache-miss gap cannot be established.
+- `NEXT TURN` in a cache-miss report is the aggregate cache-hit percentage of
+  the following recorded turn.
 - `API EST.` is an estimate using Standard API token rates, not an actual
   Codex subscription charge. It excludes tool charges, taxes, subscription
   entitlements, and Fast/Flex/Batch adjustments.

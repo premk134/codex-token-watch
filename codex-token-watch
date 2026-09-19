@@ -19,6 +19,7 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
+VERSION = "0.1.0"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
@@ -107,6 +108,11 @@ def since_value(value: str) -> tuple[int, str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Print local Codex token usage and prompt-cache diagnostics."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
     )
     parser.add_argument(
         "target",
@@ -326,6 +332,7 @@ def scan_rollout(path: Path) -> tuple[list[dict], list[dict]]:
                 "calls": [],
                 "model": None,
                 "effort": None,
+                "next_turn_cache_percent": None,
             }
             turn_order.append(turn_id)
         return turns[turn_id]
@@ -380,7 +387,6 @@ def scan_rollout(path: Path) -> tuple[list[dict], list[dict]]:
                     "usage": usage,
                     "index": len(turn["calls"]) + 1,
                     "gap_seconds": None,
-                    "next_cache_percent": None,
                     "after_compaction": compaction_pending,
                     "model": turn["model"],
                     "effort": turn["effort"],
@@ -414,14 +420,6 @@ def scan_rollout(path: Path) -> tuple[list[dict], list[dict]]:
             call["gap_seconds"] = (call["time"] - previous["time"]).total_seconds()
         previous = call
 
-    for index, call in enumerate(calls[:-1]):
-        following = calls[index + 1]
-        if following["turn_id"] == call["turn_id"]:
-            next_input = integer(following["usage"], "input_tokens")
-            next_cached = integer(following["usage"], "cached_input_tokens")
-            if next_input:
-                call["next_cache_percent"] = next_cached / next_input * 100.0
-
     ordered_turns = [turns[turn_id] for turn_id in turn_order]
     for turn in ordered_turns:
         for key in ("model", "effort"):
@@ -441,6 +439,16 @@ def scan_rollout(path: Path) -> tuple[list[dict], list[dict]]:
             turn["status"] = "latest snapshot"
         if turn["latest_record"]:
             turn["status_time"] = turn["latest_record"].get("timestamp")
+
+    reported_turns = [turn for turn in ordered_turns if turn["latest_record"]]
+    for turn, following in zip(reported_turns, reported_turns[1:]):
+        usage = following["latest_record"].get("payload", {}).get(
+            "turn_token_usage", {}
+        )
+        next_input = integer(usage, "input_tokens")
+        next_cached = integer(usage, "cached_input_tokens")
+        if next_input:
+            turn["next_turn_cache_percent"] = next_cached / next_input * 100.0
     return ordered_turns, calls
 
 
@@ -783,6 +791,7 @@ def header_style(value: str) -> str:
         "GAP": "bold_yellow",
         "WHERE": "bold_gray",
         "NEXT": "bold_green",
+        "NEXT TURN": "bold_green",
         "PROMPT": "bold_gray",
     }.get(value, "bold_white")
 
@@ -1028,7 +1037,7 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
         "WHERE",
         "INPUT",
         "API EST.",
-        "NEXT",
+        "NEXT TURN",
     ]
     rows = []
     prompts = []
@@ -1038,7 +1047,7 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
     time_only = single_task_date(all_turns)
     for turn, call in misses:
         boundary = "new turn" if call["index"] == 1 else "same turn"
-        next_percent = call["next_cache_percent"]
+        next_percent = turn["next_turn_cache_percent"]
         next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
         rows.append(
             {
@@ -1124,11 +1133,19 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
 
     if misses:
         print()
-        headers = ["TIME", "TASK", "GAP", "WHERE", "INPUT", "API EST.", "NEXT"]
+        headers = [
+            "TIME",
+            "TASK",
+            "GAP",
+            "WHERE",
+            "INPUT",
+            "API EST.",
+            "NEXT TURN",
+        ]
         rows = []
         for _time, thread_id, title, turn, call in misses:
             boundary = "new turn" if call["index"] == 1 else "same turn"
-            next_percent = call["next_cache_percent"]
+            next_percent = turn["next_turn_cache_percent"]
             next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
             task = f"{short_text(title, 30)} [{thread_id[:8]}]"
             gap_seconds = call["gap_seconds"]
