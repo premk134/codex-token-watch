@@ -7,7 +7,7 @@ Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
 logs into per-turn token and prompt-cache reports. It runs only when called and
 does not send task data anywhere.
 
-[Current release: v0.1.2](https://github.com/premk134/codex-token-watch/releases/tag/v0.1.2)
+[Current release: v0.2.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.2.0)
 
 ## What it shows
 
@@ -15,8 +15,8 @@ does not send task data anywhere.
 - Model-call count and turn duration
 - Model and reasoning-effort changes
 - API-equivalent cost estimates
-- Complete cache misses and the time since the preceding model call
-- Cache misses across one task or all recently active tasks
+- Recent turns across tasks by count or time window
+- Cache-miss prompts, model settings, and preceding-call gaps
 
 ## Screenshots
 
@@ -70,6 +70,12 @@ codex://threads/YOUR-TASK-ID
 Then run one of these commands:
 
 ```bash
+# Latest 10 turns across tasks
+codex-token-watch --last 10
+
+# Every turn from the past 6 hours
+codex-token-watch --since 6h
+
 # Latest five turns from one task
 codex-token-watch codex://threads/YOUR-TASK-ID --last 5
 
@@ -87,6 +93,7 @@ codex-token-watch --zero-cache --since 6h
 ```
 
 `--since` accepts minutes, hours, or days, such as `30m`, `6h`, or `3d`.
+For cross-task turn reports, use either `--last` or `--since`, not both.
 Use `--no-color` for plain output.
 
 ## Reading the report
@@ -96,18 +103,18 @@ Use `--no-color` for plain output.
 - `CACHE` is the percentage of input tokens served from the prompt cache.
 - `OUTPUT` excludes reasoning tokens; `REASON` shows them separately.
 - `THREAD` is the cumulative token total recorded for the task.
-- `ALL` summarizes the complete task, even when `--last` limits the visible
-  turns.
+- `ALL` summarizes the complete task in a task report, or the selected turns
+  in a cross-task report.
 - `NEXT TURN` is the following turn's aggregate cache percentage.
-- `MODEL`, `EFFORT`, and `CHANGE` identify the miss call's settings and any
-  model or effort transition at the start of its turn.
-- `PROMPT` is the user prompt that started the turn containing the cache miss.
+- `MODEL`, `EFFORT`, and `CHANGE` show the turn's settings and any transition
+  from the preceding turn.
+- `PROMPT` is the user prompt that started the reported turn.
 - `API EST.` is an API-equivalent estimate, not a Codex subscription charge.
 
 A complete cache miss means a recorded model call had zero cached input.
 Cache-miss reports automatically exclude explicit compaction resets.
-Cross-task reports also exclude first calls when the preceding call is not
-available, because their gap cannot be calculated.
+Cross-task cache-miss reports also exclude first calls when the preceding call
+is not available, because their gap cannot be calculated.
 
 ## Privacy, cost, and performance
 

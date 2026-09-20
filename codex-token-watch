@@ -19,7 +19,7 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
@@ -119,14 +119,14 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         help=(
             "Task ID, unique ID prefix, or codex://threads/<thread-id>; "
-            "omit with --zero-cache to scan recent tasks"
+            "omit with --last, --since, or --zero-cache for a cross-task report"
         ),
     )
     parser.add_argument(
         "--last",
         type=last_value,
         metavar="N",
-        help="Show only the latest N turns; omitted means every turn",
+        help="Show the latest N turns in one task, or across tasks when no task is given",
     )
     parser.add_argument(
         "--zero-cache",
@@ -141,8 +141,7 @@ def parse_args() -> argparse.Namespace:
         type=since_value,
         metavar="DURATION",
         help=(
-            "Cross-task cache-miss window such as 6h, 24h, or 3d; "
-            "requires --zero-cache without a task"
+            "Cross-task turn or cache-miss window such as 6h, 24h, or 3d"
         ),
     )
     parser.add_argument(
@@ -160,12 +159,15 @@ def parse_args() -> argparse.Namespace:
         if args.since is not None:
             parser.error("--since is only available when the task is omitted")
     else:
-        if not args.zero_cache:
-            parser.error("a task is required unless --zero-cache is used")
-        if args.last is not None:
-            parser.error("--last requires a task; use --since for a cross-task window")
-        if args.since is None:
-            args.since = (86_400, "24h")
+        if args.last is not None and args.since is not None:
+            parser.error("use either --last or --since for a cross-task report, not both")
+        if args.zero_cache:
+            if args.last is not None:
+                parser.error("--last requires a task when used with --zero-cache")
+            if args.since is None:
+                args.since = (86_400, "24h")
+        elif args.last is None and args.since is None:
+            parser.error("provide a task, --last N, --since DURATION, or --zero-cache")
     return args
 
 
@@ -235,22 +237,32 @@ def resolve_task(base: Path, selector: str) -> tuple[str, Path, str]:
     raise RuntimeError(f"Codex task not found: {selector}")
 
 
-def recent_tasks(base: Path, cutoff: datetime) -> list[tuple[str, Path, str]]:
-    """Return deduplicated tasks updated inside the requested rolling window."""
+def ordered_tasks(
+    base: Path, cutoff: datetime | None = None
+) -> list[tuple[int, str, Path, str]]:
+    """Return deduplicated tasks ordered by their latest recorded update."""
     matches: dict[str, tuple[int, str, str, str]] = {}
-    cutoff_epoch = int(cutoff.timestamp())
     for database in task_databases(base):
         try:
             with readonly_connection(database) as connection:
-                rows = connection.execute(
-                    """
-                    SELECT id, rollout_path, COALESCE(NULLIF(name, ''), title), updated_at
-                    FROM threads
-                    WHERE updated_at >= ?
-                    ORDER BY updated_at DESC
-                    """,
-                    (cutoff_epoch,),
-                ).fetchall()
+                if cutoff is None:
+                    rows = connection.execute(
+                        """
+                        SELECT id, rollout_path, COALESCE(NULLIF(name, ''), title), updated_at
+                        FROM threads
+                        ORDER BY updated_at DESC
+                        """
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT id, rollout_path, COALESCE(NULLIF(name, ''), title), updated_at
+                        FROM threads
+                        WHERE updated_at >= ?
+                        ORDER BY updated_at DESC
+                        """,
+                        (int(cutoff.timestamp()),),
+                    ).fetchall()
         except sqlite3.Error:
             continue
         for thread_id, rollout_path, title, updated_at in rows:
@@ -260,13 +272,21 @@ def recent_tasks(base: Path, cutoff: datetime) -> list[tuple[str, Path, str]]:
                 matches[thread_id] = candidate
 
     tasks = []
-    for _updated_at, thread_id, rollout_path, title in sorted(
+    for updated_at, thread_id, rollout_path, title in sorted(
         matches.values(), reverse=True
     ):
         path = Path(rollout_path).expanduser()
         if path.is_file():
-            tasks.append((thread_id, path, title))
+            tasks.append((updated_at, thread_id, path, title))
     return tasks
+
+
+def recent_tasks(base: Path, cutoff: datetime) -> list[tuple[str, Path, str]]:
+    """Return deduplicated tasks updated inside the requested rolling window."""
+    return [
+        (thread_id, path, title)
+        for _updated_at, thread_id, path, title in ordered_tasks(base, cutoff)
+    ]
 
 
 def user_message(payload: dict) -> str | None:
@@ -1025,6 +1045,232 @@ def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
         print_prompt_legend(turns)
 
 
+def collect_recent_turns(
+    base: Path,
+    last: int | None,
+    window: tuple[int, str] | None,
+) -> tuple[list[tuple], int]:
+    cutoff = None
+    if window is not None:
+        cutoff = datetime.now().astimezone() - timedelta(seconds=window[0])
+
+    selected = []
+    tasks_scanned = 0
+    for updated_at, thread_id, rollout, title in ordered_tasks(base, cutoff):
+        try:
+            turns, _calls = scan_rollout(rollout)
+        except OSError:
+            continue
+        tasks_scanned += 1
+        changes = turn_change_map(turns)
+        for turn in turns:
+            if not turn["latest_record"]:
+                continue
+            timestamp = parsed_time(turn["status_time"])
+            if timestamp is None or (cutoff is not None and timestamp < cutoff):
+                continue
+            selected.append(
+                (
+                    timestamp,
+                    thread_id,
+                    title,
+                    turn,
+                    changes.get(turn["id"], ""),
+                )
+            )
+
+        if last is not None and len(selected) >= last:
+            boundary = sorted(selected, key=lambda item: item[0], reverse=True)[
+                last - 1
+            ][0]
+            if updated_at < int(boundary.timestamp()):
+                break
+
+    selected.sort(key=lambda item: item[0])
+    if last is not None:
+        selected = selected[-last:]
+    return selected, tasks_scanned
+
+
+def recent_turn_row(item: tuple) -> dict:
+    _timestamp, thread_id, title, turn, change = item
+    usage = turn["latest_record"].get("payload", {}).get("turn_token_usage", {})
+    input_tokens = integer(usage, "input_tokens")
+    cached_tokens = integer(usage, "cached_input_tokens")
+    total_output = integer(usage, "output_tokens")
+    reasoning = integer(usage, "reasoning_output_tokens")
+    output = max(0, total_output - reasoning)
+    cache_percent = cached_tokens / input_tokens * 100.0 if input_tokens else 0.0
+    model = turn_setting(turn, "model")
+    model = model_display(model) if model != "—" else model
+    task = f"{short_text(title, 28)} [{thread_id[:8]}]"
+    return {
+        "cells": [
+            table_time(turn["status_time"], False),
+            task,
+            format_count(input_tokens),
+            f"{cache_percent:.1f}%",
+            format_count(output),
+            format_count(reasoning),
+            format_usd(turn_api_cost(turn)),
+            model,
+            turn_setting(turn, "effort"),
+            str(len(turn["calls"])),
+            turn_duration(turn),
+            change or "—",
+        ],
+        "styles": [
+            "gray",
+            "white",
+            "white",
+            cache_style(cache_percent),
+            "white",
+            "gray",
+            "cyan",
+            "violet",
+            "cyan",
+            "gray",
+            "gray",
+            change_style(change),
+        ],
+    }
+
+
+def recent_turn_summary(items: list[tuple]) -> dict:
+    turns = [item[3] for item in items]
+    usages = [
+        turn["latest_record"].get("payload", {}).get("turn_token_usage", {})
+        for turn in turns
+    ]
+    input_tokens = sum(integer(usage, "input_tokens") for usage in usages)
+    cached_tokens = sum(integer(usage, "cached_input_tokens") for usage in usages)
+    total_output = sum(integer(usage, "output_tokens") for usage in usages)
+    reasoning = sum(integer(usage, "reasoning_output_tokens") for usage in usages)
+    output = max(0, total_output - reasoning)
+    cache_percent = cached_tokens / input_tokens * 100.0 if input_tokens else 0.0
+    costs = [turn_api_cost(turn) for turn in turns]
+    total_cost = (
+        None
+        if any(cost is None for cost in costs)
+        else sum(cost for cost in costs if cost is not None)
+    )
+    models = {turn_setting(turn, "model") for turn in turns}
+    efforts = {turn_setting(turn, "effort") for turn in turns}
+    model = next(iter(models)) if len(models) == 1 else "mixed"
+    model = model_display(model) if model not in {"—", "mixed"} else model
+    effort = next(iter(efforts)) if len(efforts) == 1 else "mixed"
+    duration_seconds = 0.0
+    for turn in turns:
+        start, end = turn_bounds(turn)
+        if start is not None and end is not None:
+            duration_seconds += max(0.0, (end - start).total_seconds())
+    duration = f"{int((duration_seconds + 30) // 60)}m"
+    task_count = len({item[1] for item in items})
+    return {
+        "cells": [
+            "ALL",
+            f"{task_count} {'task' if task_count == 1 else 'tasks'}",
+            format_count(input_tokens),
+            f"{cache_percent:.1f}%",
+            format_count(output),
+            format_count(reasoning),
+            format_usd(total_cost),
+            model,
+            effort,
+            str(sum(len(turn["calls"]) for turn in turns)),
+            duration,
+            "",
+        ],
+        "styles": [
+            "bold_cyan",
+            "bold_white",
+            "bold_white",
+            cache_style(cache_percent),
+            "bold_white",
+            "bold_gray",
+            "bold_cyan",
+            "bold_violet",
+            "bold_cyan",
+            "bold_gray",
+            "bold_gray",
+            "gray",
+        ],
+        "separator_before": True,
+    }
+
+
+def print_recent_turn_prompt_legend(items: list[tuple]) -> None:
+    width = max(24, shutil.get_terminal_size(fallback=(120, 24)).columns - 26)
+    print()
+    print(paint("PROMPTS", "bold_gray"))
+    for _timestamp, thread_id, _title, turn, _change in items:
+        if not turn["prompt"]:
+            continue
+        label = f"{table_time(turn['status_time'], False)} [{thread_id[:8]}]"
+        print(
+            f"{paint(label, 'sky')}  "
+            f"{paint(short_text(turn['prompt'], width), 'gray')}"
+        )
+
+
+def print_recent_turns(
+    base: Path,
+    last: int | None,
+    window: tuple[int, str] | None,
+) -> int:
+    items, tasks_scanned = collect_recent_turns(base, last, window)
+    if last is not None:
+        label = f"LAST {last}"
+    else:
+        assert window is not None
+        label = f"LAST {window[1].upper()}"
+    print(
+        paint("RECENT TURNS", "bold_cyan")
+        + paint("  ·  ", "gray")
+        + paint(label, "bold_white")
+    )
+    if not items:
+        print()
+        print(paint("No turns with token usage found.", "bold_yellow"))
+        return 0
+
+    print()
+    headers = [
+        "TIME",
+        "TASK",
+        "INPUT",
+        "CACHE",
+        "OUTPUT",
+        "REASON",
+        "API EST.",
+        "MODEL",
+        "EFFORT",
+        "CALLS",
+        "DURATION",
+        "CHANGE",
+    ]
+    rows = [recent_turn_row(item) for item in items]
+    prompts = [item[3]["prompt"] for item in items]
+    rows.append(recent_turn_summary(items))
+    prompts.append("Selected turns")
+    has_prompt_column = add_prompt_column(headers, rows, prompts)
+    print_table(headers, rows, right={2, 3, 4, 5, 6, 9, 10})
+    if not has_prompt_column:
+        print_recent_turn_prompt_legend(items)
+
+    print()
+    print(
+        paint("SCANNED", "bold_gray")
+        + "  "
+        + paint(
+            f"{len(items)} {'turn' if len(items) == 1 else 'turns'}  ·  "
+            f"{tasks_scanned} {'task' if tasks_scanned == 1 else 'tasks'} checked",
+            "white",
+        )
+    )
+    return 0
+
+
 def selected_turns(turns: list[dict], last: int | None) -> list[dict]:
     available = [turn for turn in turns if turn["latest_record"]]
     if last is None:
@@ -1246,7 +1492,9 @@ def main() -> int:
     USE_COLOR = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
     if args.target is None:
         try:
-            return print_recent_zero_cache(codex_dir(), args.since)
+            if args.zero_cache:
+                return print_recent_zero_cache(codex_dir(), args.since)
+            return print_recent_turns(codex_dir(), args.last, args.since)
         except (RuntimeError, OSError, sqlite3.Error) as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
