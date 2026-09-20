@@ -19,7 +19,7 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
@@ -148,6 +148,11 @@ def parse_args() -> argparse.Namespace:
         "--no-color",
         action="store_true",
         help="Disable terminal colors",
+    )
+    parser.add_argument(
+        "--hide-luna",
+        action="store_true",
+        help="Hide Luna-only rows while keeping their usage in totals",
     )
     args = parser.parse_args(normalized_cli_args())
     if args.target is not None:
@@ -520,6 +525,32 @@ def model_display(model: str) -> str:
         if model.startswith(prefix + "-"):
             return MODEL_LABELS[prefix]
     return model
+
+
+def luna_model(model: str | None) -> bool:
+    return bool(
+        model
+        and (model == "gpt-5.6-luna" or model.startswith("gpt-5.6-luna-"))
+    )
+
+
+def luna_only_turn(turn: dict) -> bool:
+    models = {call.get("model") for call in turn.get("calls", []) if call.get("model")}
+    if not models and turn.get("model"):
+        models.add(turn["model"])
+    return bool(models) and all(luna_model(model) for model in models)
+
+
+def print_hidden_luna(count: int, noun: str) -> None:
+    if count == 0:
+        return
+    suffix = noun if count == 1 else f"{noun}s"
+    print()
+    print(
+        paint("HIDDEN", "bold_gray")
+        + "  "
+        + paint(f"{count} Luna {suffix} · included in totals", "gray")
+    )
 
 
 def model_header_display(model: str) -> str:
@@ -1008,7 +1039,13 @@ def thread_row(turns: list[dict]) -> dict:
     }
 
 
-def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
+def print_turns(
+    turns: list[dict], all_turns: list[dict], hide_luna: bool = False
+) -> None:
+    visible_turns = (
+        [turn for turn in turns if not luna_only_turn(turn)] if hide_luna else turns
+    )
+    hidden_count = len(turns) - len(visible_turns)
     headers = [
         "TIME",
         "INPUT",
@@ -1021,9 +1058,9 @@ def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
         "DURATION",
     ]
     time_only = single_task_date(all_turns)
-    rows = [turn_row(turn, time_only) for turn in turns]
+    rows = [turn_row(turn, time_only) for turn in visible_turns]
     changes = turn_change_map(all_turns)
-    selected_changes = [changes.get(turn["id"], "") for turn in turns]
+    selected_changes = [changes.get(turn["id"], "") for turn in visible_turns]
     show_changes = any(selected_changes)
     numeric_columns = set(range(1, len(headers)))
     if show_changes:
@@ -1032,7 +1069,7 @@ def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
             row["cells"].append(change)
             row["styles"].append(change_style(change))
 
-    prompts = [turn["prompt"] for turn in turns]
+    prompts = [turn["prompt"] for turn in visible_turns]
     summary = thread_row(all_turns)
     if show_changes:
         summary["cells"].append("")
@@ -1041,8 +1078,9 @@ def print_turns(turns: list[dict], all_turns: list[dict]) -> None:
     prompts.append("Complete task")
     has_prompt_column = add_prompt_column(headers, rows, prompts)
     print_table(headers, rows, right=numeric_columns)
-    if not has_prompt_column and len(turns) <= 5:
-        print_prompt_legend(turns)
+    if not has_prompt_column and len(visible_turns) <= 5:
+        print_prompt_legend(visible_turns)
+    print_hidden_luna(hidden_count, "turn")
 
 
 def collect_recent_turns(
@@ -1050,40 +1088,64 @@ def collect_recent_turns(
     last: int | None,
     window: tuple[int, str] | None,
 ) -> tuple[list[tuple], int]:
-    cutoff = None
-    if window is not None:
-        cutoff = datetime.now().astimezone() - timedelta(seconds=window[0])
-
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(seconds=window[0]) if window is not None else None
+    search_cutoffs = [cutoff] if cutoff is not None else [
+        now - timedelta(hours=1),
+        now - timedelta(hours=6),
+        now - timedelta(days=1),
+        now - timedelta(days=7),
+        now - timedelta(days=30),
+        now - timedelta(days=365),
+        datetime.fromtimestamp(0).astimezone(),
+    ]
     selected = []
     tasks_scanned = 0
-    for updated_at, thread_id, rollout, title in ordered_tasks(base, cutoff):
-        try:
-            turns, _calls = scan_rollout(rollout)
-        except OSError:
-            continue
-        tasks_scanned += 1
-        changes = turn_change_map(turns)
-        for turn in turns:
-            if not turn["latest_record"]:
+    scanned_threads = set()
+    finished = False
+    for search_cutoff in search_cutoffs:
+        for updated_at, thread_id, rollout, title in ordered_tasks(
+            base, search_cutoff
+        ):
+            if thread_id in scanned_threads:
                 continue
-            timestamp = parsed_time(turn["status_time"])
-            if timestamp is None or (cutoff is not None and timestamp < cutoff):
+            scanned_threads.add(thread_id)
+            try:
+                turns, _calls = scan_rollout(rollout)
+            except OSError:
                 continue
-            selected.append(
-                (
-                    timestamp,
-                    thread_id,
-                    title,
-                    turn,
-                    changes.get(turn["id"], ""),
+            tasks_scanned += 1
+            changes = turn_change_map(turns)
+            for turn in turns:
+                if not turn["latest_record"]:
+                    continue
+                timestamp = parsed_time(turn["status_time"])
+                if timestamp is None or (cutoff is not None and timestamp < cutoff):
+                    continue
+                selected.append(
+                    (
+                        timestamp,
+                        thread_id,
+                        title,
+                        turn,
+                        changes.get(turn["id"], ""),
+                    )
                 )
-            )
 
+            if last is not None and len(selected) >= last:
+                boundary = sorted(selected, key=lambda item: item[0], reverse=True)[
+                    last - 1
+                ][0]
+                if updated_at < int(boundary.timestamp()):
+                    finished = True
+                    break
+        if finished or window is not None:
+            break
         if last is not None and len(selected) >= last:
             boundary = sorted(selected, key=lambda item: item[0], reverse=True)[
                 last - 1
             ][0]
-            if updated_at < int(boundary.timestamp()):
+            if search_cutoff < boundary:
                 break
 
     selected.sort(key=lambda item: item[0])
@@ -1217,6 +1279,7 @@ def print_recent_turns(
     base: Path,
     last: int | None,
     window: tuple[int, str] | None,
+    hide_luna: bool = False,
 ) -> int:
     items, tasks_scanned = collect_recent_turns(base, last, window)
     if last is not None:
@@ -1234,6 +1297,13 @@ def print_recent_turns(
         print(paint("No turns with token usage found.", "bold_yellow"))
         return 0
 
+    visible_items = (
+        [item for item in items if not luna_only_turn(item[3])]
+        if hide_luna
+        else items
+    )
+    hidden_count = len(items) - len(visible_items)
+
     print()
     headers = [
         "TIME",
@@ -1249,14 +1319,15 @@ def print_recent_turns(
         "DURATION",
         "CHANGE",
     ]
-    rows = [recent_turn_row(item) for item in items]
-    prompts = [item[3]["prompt"] for item in items]
+    rows = [recent_turn_row(item) for item in visible_items]
+    prompts = [item[3]["prompt"] for item in visible_items]
     rows.append(recent_turn_summary(items))
     prompts.append("Selected turns")
     has_prompt_column = add_prompt_column(headers, rows, prompts)
     print_table(headers, rows, right={2, 3, 4, 5, 6, 9, 10})
     if not has_prompt_column:
-        print_recent_turn_prompt_legend(items)
+        print_recent_turn_prompt_legend(visible_items)
+    print_hidden_luna(hidden_count, "turn")
 
     print()
     print(
@@ -1278,7 +1349,9 @@ def selected_turns(turns: list[dict], last: int | None) -> list[dict]:
     return available[-last:]
 
 
-def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
+def print_zero_cache(
+    turns: list[dict], all_turns: list[dict], hide_luna: bool = False
+) -> int:
     total_calls = sum(len(turn["calls"]) for turn in turns)
     misses = [
         (turn, call)
@@ -1293,6 +1366,18 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
         + f"  {len(misses)} / {total_calls} model calls"
     )
     if not misses:
+        return 0
+
+    visible_misses = (
+        [(turn, call) for turn, call in misses if not luna_model(call.get("model"))]
+        if hide_luna
+        else misses
+    )
+    hidden_count = len(misses) - len(visible_misses)
+    if not visible_misses:
+        print()
+        print(paint("No non-Luna cache misses to display.", "bold_green"))
+        print_hidden_luna(hidden_count, "cache-miss row")
         return 0
 
     headers = [
@@ -1310,7 +1395,7 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
     row_changes = []
     change_seen = set()
     time_only = single_task_date(all_turns)
-    for turn, call in misses:
+    for turn, call in visible_misses:
         boundary = "new turn" if call["index"] == 1 else "same turn"
         next_percent = turn["next_turn_cache_percent"]
         next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
@@ -1350,13 +1435,16 @@ def print_zero_cache(turns: list[dict], all_turns: list[dict]) -> int:
     right = {1, 4, 5, 6}
     has_prompt_column = add_prompt_column(headers, rows, prompts)
     print_table(headers, rows, right=right)
-    miss_turns = [turn for turn, _call in misses]
+    miss_turns = [turn for turn, _call in visible_misses]
     if not has_prompt_column and len({turn["id"] for turn in miss_turns}) <= 10:
         print_prompt_legend(miss_turns)
+    print_hidden_luna(hidden_count, "cache-miss row")
     return 0
 
 
-def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
+def print_recent_zero_cache(
+    base: Path, window: tuple[int, str], hide_luna: bool = False
+) -> int:
     seconds, label = window
     cutoff = datetime.now().astimezone() - timedelta(seconds=seconds)
     misses = []
@@ -1406,7 +1494,14 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
         + paint(f"LAST {label.upper()}", "bold_white")
     )
 
-    if misses:
+    visible_misses = (
+        [item for item in misses if not luna_model(item[4].get("model"))]
+        if hide_luna
+        else misses
+    )
+    hidden_count = len(misses) - len(visible_misses)
+
+    if visible_misses:
         print()
         headers = [
             "TIME",
@@ -1423,7 +1518,7 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
         rows = []
         prompts = []
         change_seen = set()
-        for _time, thread_id, title, turn, call, change in misses:
+        for _time, thread_id, title, turn, call, change in visible_misses:
             boundary = "new turn" if call["index"] == 1 else "same turn"
             next_percent = turn["next_turn_cache_percent"]
             next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
@@ -1464,7 +1559,12 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
         has_prompt_column = add_prompt_column(headers, rows, prompts)
         print_table(headers, rows, right={6, 7, 8})
         if not has_prompt_column:
-            print_recent_prompt_legend(misses)
+            print_recent_prompt_legend(visible_misses)
+        print_hidden_luna(hidden_count, "cache-miss row")
+    elif misses:
+        print()
+        print(paint("No non-Luna cache misses to display.", "bold_green"))
+        print_hidden_luna(hidden_count, "cache-miss row")
     else:
         print()
         print(paint("No complete cache misses found.", "bold_green"))
@@ -1493,8 +1593,12 @@ def main() -> int:
     if args.target is None:
         try:
             if args.zero_cache:
-                return print_recent_zero_cache(codex_dir(), args.since)
-            return print_recent_turns(codex_dir(), args.last, args.since)
+                return print_recent_zero_cache(
+                    codex_dir(), args.since, hide_luna=args.hide_luna
+                )
+            return print_recent_turns(
+                codex_dir(), args.last, args.since, hide_luna=args.hide_luna
+            )
         except (RuntimeError, OSError, sqlite3.Error) as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
@@ -1516,7 +1620,7 @@ def main() -> int:
 
     if args.zero_cache:
         print()
-        return print_zero_cache(reports, all_turns)
+        return print_zero_cache(reports, all_turns, hide_luna=args.hide_luna)
 
     print()
     if len(reports) > 1:
@@ -1525,7 +1629,7 @@ def main() -> int:
             + "  "
             + paint(str(len(reports)), "bold_white")
         )
-    print_turns(reports, all_turns)
+    print_turns(reports, all_turns, hide_luna=args.hide_luna)
     return 0
 
 

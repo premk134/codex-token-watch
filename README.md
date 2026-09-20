@@ -7,7 +7,7 @@ Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
 logs into per-turn token and prompt-cache reports. It runs only when called and
 does not send task data anywhere.
 
-[Current release: v0.2.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.2.0)
+[Current release: v0.3.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.3.0)
 
 ## What it shows
 
@@ -76,6 +76,9 @@ codex-token-watch --last 10
 # Every turn from the past 6 hours
 codex-token-watch --since 6h
 
+# Hide Luna-only rows but retain their usage in ALL
+codex-token-watch --last 10 --hide-luna
+
 # Latest five turns from one task
 codex-token-watch codex://threads/YOUR-TASK-ID --last 5
 
@@ -94,6 +97,8 @@ codex-token-watch --zero-cache --since 6h
 
 `--since` accepts minutes, hours, or days, such as `30m`, `6h`, or `3d`.
 For cross-task turn reports, use either `--last` or `--since`, not both.
+`--hide-luna` hides Luna-only rows while retaining them in totals. Mixed-model
+turns remain visible.
 Use `--no-color` for plain output.
 
 ## Reading the report
