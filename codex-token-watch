@@ -19,7 +19,7 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
@@ -842,6 +842,23 @@ def print_prompt_legend(turns: list[dict]) -> None:
         )
 
 
+def print_recent_prompt_legend(misses: list[tuple]) -> None:
+    width = max(24, shutil.get_terminal_size(fallback=(120, 24)).columns - 26)
+    print()
+    print(paint("PROMPTS", "bold_gray"))
+    seen = set()
+    for _time, thread_id, _title, turn, call in misses:
+        key = (thread_id, turn["id"])
+        if key in seen or not turn["prompt"]:
+            continue
+        seen.add(key)
+        label = f"{table_time(call['timestamp'], False)} [{thread_id[:8]}]"
+        print(
+            f"{paint(label, 'sky')}  "
+            f"{paint(short_text(turn['prompt'], width), 'gray')}"
+        )
+
+
 def print_table(headers: list[str], rows: list[dict], right: set[int] | None = None) -> None:
     right = right or set()
     widths = [len(header) for header in headers]
@@ -1143,6 +1160,7 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
             "NEXT TURN",
         ]
         rows = []
+        prompts = []
         for _time, thread_id, title, turn, call in misses:
             boundary = "new turn" if call["index"] == 1 else "same turn"
             next_percent = turn["next_turn_cache_percent"]
@@ -1171,7 +1189,11 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
                     ],
                 }
             )
+            prompts.append(turn["prompt"])
+        has_prompt_column = add_prompt_column(headers, rows, prompts)
         print_table(headers, rows, right={4, 5, 6})
+        if not has_prompt_column:
+            print_recent_prompt_legend(misses)
     else:
         print()
         print(paint("No complete cache misses found.", "bold_green"))
