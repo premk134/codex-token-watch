@@ -7,7 +7,7 @@ Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
 logs into per-turn token and prompt-cache reports. It runs only when called and
 does not send task data anywhere.
 
-[Current release: v0.1.1](https://github.com/premk134/codex-token-watch/releases/tag/v0.1.1)
+[Current release: v0.1.2](https://github.com/premk134/codex-token-watch/releases/tag/v0.1.2)
 
 ## What it shows
 
@@ -99,6 +99,8 @@ Use `--no-color` for plain output.
 - `ALL` summarizes the complete task, even when `--last` limits the visible
   turns.
 - `NEXT TURN` is the following turn's aggregate cache percentage.
+- `MODEL`, `EFFORT`, and `CHANGE` identify the miss call's settings and any
+  model or effort transition at the start of its turn.
 - `PROMPT` is the user prompt that started the turn containing the cache miss.
 - `API EST.` is an API-equivalent estimate, not a Codex subscription charge.
 

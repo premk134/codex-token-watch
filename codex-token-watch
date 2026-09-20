@@ -19,7 +19,7 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
@@ -792,6 +792,8 @@ def header_style(value: str) -> str:
         "WHERE": "bold_gray",
         "NEXT": "bold_green",
         "NEXT TURN": "bold_green",
+        "MODEL": "bold_violet",
+        "EFFORT": "bold_cyan",
         "PROMPT": "bold_gray",
     }.get(value, "bold_white")
 
@@ -847,7 +849,7 @@ def print_recent_prompt_legend(misses: list[tuple]) -> None:
     print()
     print(paint("PROMPTS", "bold_gray"))
     seen = set()
-    for _time, thread_id, _title, turn, call in misses:
+    for _time, thread_id, _title, turn, call, _change in misses:
         key = (thread_id, turn["id"])
         if key in seen or not turn["prompt"]:
             continue
@@ -1120,6 +1122,7 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
             turns, calls = scan_rollout(rollout)
         except OSError:
             continue
+        changes = turn_change_map(turns)
         window_calls = [
             call
             for call in calls
@@ -1139,7 +1142,16 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
                     continue
                 if call["after_compaction"] or call["gap_seconds"] is None:
                     continue
-                misses.append((call["time"], thread_id, title, turn, call))
+                misses.append(
+                    (
+                        call["time"],
+                        thread_id,
+                        title,
+                        turn,
+                        call,
+                        changes.get(turn["id"], ""),
+                    )
+                )
 
     misses.sort(key=lambda item: item[0])
     print(
@@ -1153,45 +1165,58 @@ def print_recent_zero_cache(base: Path, window: tuple[int, str]) -> int:
         headers = [
             "TIME",
             "TASK",
+            "MODEL",
+            "EFFORT",
             "GAP",
             "WHERE",
             "INPUT",
             "API EST.",
             "NEXT TURN",
+            "CHANGE",
         ]
         rows = []
         prompts = []
-        for _time, thread_id, title, turn, call in misses:
+        change_seen = set()
+        for _time, thread_id, title, turn, call, change in misses:
             boundary = "new turn" if call["index"] == 1 else "same turn"
             next_percent = turn["next_turn_cache_percent"]
             next_value = "—" if next_percent is None else f"{next_percent:.1f}%"
             task = f"{short_text(title, 30)} [{thread_id[:8]}]"
             gap_seconds = call["gap_seconds"]
+            turn_key = (thread_id, turn["id"])
+            change_value = change if turn_key not in change_seen else ""
+            change_seen.add(turn_key)
             rows.append(
                 {
                     "cells": [
                         table_time(call["timestamp"], False),
                         task,
+                        model_display(call.get("model") or "—"),
+                        call.get("effort") or "—",
                         format_gap(gap_seconds),
                         boundary,
                         format_count(integer(call["usage"], "input_tokens")),
                         format_usd(call_api_cost(call)),
                         next_value,
+                        change_value or "—",
                     ],
                     "styles": [
                         "gray",
                         "white",
+                        "violet",
+                        "cyan",
                         "bold_red" if gap_seconds < 1_800 else "gray",
                         "bold_red" if boundary == "same turn" else "gray",
                         "white",
                         "cyan",
                         None if next_percent is None else cache_style(next_percent),
+                        change_style(change_value),
                     ],
                 }
             )
             prompts.append(turn["prompt"])
         has_prompt_column = add_prompt_column(headers, rows, prompts)
-        print_table(headers, rows, right={4, 5, 6})
+        print_table(headers, rows, right={6, 7, 8})
         if not has_prompt_column:
             print_recent_prompt_legend(misses)
     else:
