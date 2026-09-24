@@ -7,7 +7,7 @@ Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
 logs into per-turn token and prompt-cache reports. It runs only when called and
 does not send task data anywhere.
 
-[Current release: v0.3.0](https://github.com/premk134/codex-token-watch/releases/tag/v0.3.0)
+[Current release: v0.3.1](https://github.com/premk134/codex-token-watch/releases/tag/v0.3.1)
 
 ## What it shows
 
@@ -130,8 +130,10 @@ Cost estimates use Standard API token rates and exclude tool charges, taxes,
 subscription entitlements, and Fast/Flex/Batch adjustments. Unknown models or
 incomplete history display `—` instead of an estimate.
 
-Embedded prices were checked on 2026-09-19 against the official pages for
+Embedded prices were checked on 2026-09-24 against the official pages for
 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna),
 [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol),
 [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), and
 [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna).

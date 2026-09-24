@@ -19,12 +19,14 @@ TASK_TITLE_LIMIT = 96
 PROMPT_LIMIT = 112
 USE_COLOR = False
 LONG_CONTEXT_THRESHOLD = 272_000
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # Standard API rates in USD per 1M text tokens. Cache writes are documented as
 # 1.25x uncached input for these models.
 API_PRICING = {
     "gpt-6-astra": {"input": 10.00, "cached": 1.00, "cache_write": 12.50, "output": 50.00},
+    "gpt-6-sol": {"input": 2.00, "cached": 0.20, "cache_write": 2.50, "output": 10.00},
+    "gpt-6-luna": {"input": 0.10, "cached": 0.01, "cache_write": 0.125, "output": 0.50},
     "gpt-5.6-sol": {"input": 4.00, "cached": 0.40, "cache_write": 5.00, "output": 20.00},
     "gpt-5.6": {"input": 4.00, "cached": 0.40, "cache_write": 5.00, "output": 20.00},
     "gpt-5.6-terra": {"input": 2.00, "cached": 0.20, "cache_write": 2.50, "output": 12.00},
@@ -33,6 +35,8 @@ API_PRICING = {
 
 MODEL_LABELS = {
     "gpt-6-astra": "Astra",
+    "gpt-6-sol": "Sol",
+    "gpt-6-luna": "Luna",
     "gpt-5.6-sol": "Sol",
     "gpt-5.6": "Sol",
     "gpt-5.6-terra": "Terra",
@@ -41,6 +45,8 @@ MODEL_LABELS = {
 
 MODEL_HEADER_LABELS = {
     "gpt-6-astra": "GPT-6 Astra",
+    "gpt-6-sol": "GPT-6 Sol",
+    "gpt-6-luna": "GPT-6 Luna",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
@@ -512,7 +518,7 @@ def pricing_for_model(model: str | None) -> dict[str, float] | None:
         return None
     if model in API_PRICING:
         return API_PRICING[model]
-    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+    for prefix in API_PRICING:
         if model.startswith(prefix + "-"):
             return API_PRICING[prefix]
     return None
@@ -521,7 +527,7 @@ def pricing_for_model(model: str | None) -> dict[str, float] | None:
 def model_display(model: str) -> str:
     if model in MODEL_LABELS:
         return MODEL_LABELS[model]
-    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+    for prefix in MODEL_LABELS:
         if model.startswith(prefix + "-"):
             return MODEL_LABELS[prefix]
     return model
@@ -530,7 +536,10 @@ def model_display(model: str) -> str:
 def luna_model(model: str | None) -> bool:
     return bool(
         model
-        and (model == "gpt-5.6-luna" or model.startswith("gpt-5.6-luna-"))
+        and any(
+            model == prefix or model.startswith(prefix + "-")
+            for prefix in ("gpt-6-luna", "gpt-5.6-luna")
+        )
     )
 
 
@@ -556,7 +565,7 @@ def print_hidden_luna(count: int, noun: str) -> None:
 def model_header_display(model: str) -> str:
     if model in MODEL_HEADER_LABELS:
         return MODEL_HEADER_LABELS[model]
-    for prefix in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+    for prefix in MODEL_HEADER_LABELS:
         if model.startswith(prefix + "-"):
             return MODEL_HEADER_LABELS[prefix]
     return model
