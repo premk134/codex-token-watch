@@ -7,14 +7,14 @@ Codex Token Watch is a read-only macOS CLI that turns Codex Desktop's local task
 logs into per-turn token and prompt-cache reports. It runs only when called and
 does not send task data anywhere.
 
-[Current release: v0.3.1](https://github.com/premk134/codex-token-watch/releases/tag/v0.3.1)
+[Current release: v0.3.2](https://github.com/premk134/codex-token-watch/releases/tag/v0.3.2)
 
 ## What it shows
 
 - Input, cached, output, and reasoning tokens for each turn
 - Model-call count and turn duration
 - Model and reasoning-effort changes
-- API-equivalent cost estimates
+- Base API-rate cost comparisons
 - Recent turns across tasks by count or time window
 - Cache-miss prompts, model settings, and preceding-call gaps
 
@@ -114,7 +114,7 @@ Use `--no-color` for plain output.
 - `MODEL`, `EFFORT`, and `CHANGE` show the turn's settings and any transition
   from the preceding turn.
 - `PROMPT` is the user prompt that started the reported turn.
-- `API EST.` is an API-equivalent estimate, not a Codex subscription charge.
+- `API EST.` compares usage using base API rates; it is not a Codex charge.
 
 A complete cache miss means a recorded model call had zero cached input.
 Cache-miss reports automatically exclude explicit compaction resets.
@@ -126,9 +126,10 @@ is not available, because their gap cannot be calculated.
 Codex Token Watch reads local Codex state and rollout files in read-only mode.
 It does not modify Codex data, upload task contents, or run in the background.
 
-Cost estimates use Standard API token rates and exclude tool charges, taxes,
-subscription entitlements, and Fast/Flex/Batch adjustments. Unknown models or
-incomplete history display `—` instead of an estimate.
+Cost estimates use base Standard API token rates without the API long-context
+multiplier. They are comparisons, not Codex subscription charges or exact API
+bills. Tool charges, taxes, subscription entitlements, and Fast/Flex/Batch
+adjustments are excluded. Unknown models or incomplete history display `—`.
 
 Embedded prices were checked on 2026-09-24 against the official pages for
 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
